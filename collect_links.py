@@ -24,6 +24,7 @@ import platform
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 import os.path as osp
 
 
@@ -36,7 +37,8 @@ class CollectLinks:
             executable = './chromedriver/chromedriver_win.exe'
         elif platform.system() == 'Linux':
             print('Detected OS : Linux')
-            executable = './chromedriver/chromedriver_linux'
+#             executable = './chromedriver/chromedriver_linux'
+            executable=ChromeDriverManager().install()
         elif platform.system() == 'Darwin':
             print('Detected OS : Mac')
             executable = './chromedriver/chromedriver_mac'

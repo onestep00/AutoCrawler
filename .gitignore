@@ -105,3 +105,8 @@ venv.bak/
 
 download
 .idea
+!requirements.txt 
+/*.deb
+/*.csv
+/*.tsv
+/*.txt

@@ -19,11 +19,15 @@ import os
 import requests
 import shutil
 from multiprocessing import Pool
+import multiprocessing
 import argparse
 from collect_links import CollectLinks
 import imghdr
 import base64
-
+import uuid
+from imutils import paths
+import cv2
+import sqlite3
 
 class Sites:
     GOOGLE = 1
@@ -52,7 +56,7 @@ class Sites:
 
 class AutoCrawler:
     def __init__(self, skip_already_exist=True, n_threads=4, do_google=True, do_naver=True, download_path='download',
-                 full_resolution=False, face=False, no_gui=False, limit=0):
+                 full_resolution=False, face=False, no_gui=False, limit=0, db_path='/home/jovyan/db/crawler.db'):
         """
         :param skip_already_exist: Skips keyword already downloaded before. This is needed when re-downloading.
         :param n_threads: Number of threads to download.
@@ -74,8 +78,57 @@ class AutoCrawler:
         self.face = face
         self.no_gui = no_gui
         self.limit = limit
+        self.db_path = db_path
 
-        os.makedirs('./{}'.format(self.download_path), exist_ok=True)
+        os.makedirs(self.download_path, exist_ok=True)
+        
+        
+    def check_image(self, imgPath):
+        image = self.loadImageFromPath(imgPath)
+        if image is None:
+            return (False, "no image")
+        size = self.image_sizer(image)
+        if not size:
+            return (False, "size is small")
+        h = self.dhash(image)
+        if not self.exist_db(h):
+            return (False, h)
+        return (True, h)
+        
+    @staticmethod
+    def loadImageFromPath(imgPath):
+        try:
+            # gif 처리
+            if str(imgPath).lower().endswith('.gif'):
+                return None
+#                 gif = cv2.VideoCapture(imgPath)
+#                 ret, frame = gif.read()  # ret=True if it finds a frame else False.
+#                 if ret:
+#                     return frame
+            else:
+                return cv2.imread(imgPath)
+        except Exception as e:
+            print(e)
+            return None
+
+    @staticmethod
+    def image_sizer(image):
+        return image.shape[0] > 400 and image.shape[1] > 400
+    
+    @staticmethod
+    def dhash(image, hashSize=8):
+        # convert the image to grayscale and resize the grayscale image,
+        # adding a single column (width) so we can compute the horizontal
+        # gradient
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        resized = cv2.resize(gray, (hashSize + 1, hashSize))
+
+        # compute the (relative) horizontal gradient between adjacent
+        # column pixels
+        diff = resized[:, 1:] > resized[:, :-1]
+
+        # convert the difference image to a hash and return it
+        return sum([2 ** i for (i, v) in enumerate(diff.flatten()) if v])
 
     @staticmethod
     def all_dirs(path):
@@ -160,7 +213,7 @@ class AutoCrawler:
         data = base64.decodebytes(bytes(encoded, encoding='utf-8'))
         return data
 
-    def download_images(self, keyword, links, site_name, max_count=0):
+    def download_images(self, keyword, links, site_name, queue, max_count=0):
         self.make_dir('{}/{}'.format(self.download_path, keyword.replace('"', '')))
         total = len(links)
         success_count = 0
@@ -188,7 +241,8 @@ class AutoCrawler:
                     ext = self.get_extension_from_link(link)
                     is_base64 = False
 
-                no_ext_path = '{}/{}/{}_{}'.format(self.download_path.replace('"', ''), keyword, site_name, str(index).zfill(4))
+#                 no_ext_path = '{}/{}/{}_{}'.format(self.download_path.replace('"', ''), keyword, site_name, str(index).zfill(4))
+                no_ext_path = '{}/{}/{}'.format(self.download_path.replace('"', ''), keyword, str(uuid.uuid4()))
                 path = no_ext_path + '.' + ext
                 self.save_object_to_file(response, path, is_base64=is_base64)
 
@@ -205,12 +259,17 @@ class AutoCrawler:
                         path2 = no_ext_path + '.' + ext2
                         os.rename(path, path2)
                         print('Renamed extension {} -> {}'.format(ext, ext2))
-
+                        path = path2
+                    check, h = self.check_image(path)
+                    print(f'check : {check}, h : {h}')
+                    if not check:
+                        os.remove(path)
+                    self.write_db(h, keyword, path, check)
             except Exception as e:
                 print('Download failed - ', e)
                 continue
 
-    def download_from_site(self, keyword, site_code):
+    def download_from_site(self, keyword, site_code, queue):
         site_name = Sites.get_text(site_code)
         add_url = Sites.get_face_url(site_code) if self.face else ""
 
@@ -240,40 +299,46 @@ class AutoCrawler:
                 links = []
 
             print('Downloading images from collected links... {} from {}'.format(keyword, site_name))
-            self.download_images(keyword, links, site_name, max_count=self.limit)
+            self.download_images(keyword, links, site_name, queue, max_count=self.limit)
 
             print('Done {} : {}'.format(site_name, keyword))
+            queue.put("Done")
 
         except Exception as e:
             print('Exception {}:{} - {}'.format(site_name, keyword, e))
 
     def download(self, args):
-        self.download_from_site(keyword=args[0], site_code=args[1])
+        self.download_from_site(keyword=args[0], site_code=args[1], queue=args[2])
 
     def do_crawling(self):
         keywords = self.get_keywords()
 
         tasks = []
-
+        pool = Pool(self.n_threads)
+        m = multiprocessing.Manager()
+        q = m.Queue()  
+        
         for keyword in keywords:
             dir_name = '{}/{}'.format(self.download_path, keyword)
-            if os.path.exists(os.path.join(os.getcwd(), dir_name)) and self.skip:
+            if (os.path.exists(os.path.join(os.getcwd(), dir_name)) and 
+                self.skip and
+                len(os.listdir(os.path.join(os.getcwd(), dir_name))) > 50):
                 print('Skipping already existing directory {}'.format(dir_name))
                 continue
 
             if self.do_google:
                 if self.full_resolution:
-                    tasks.append([keyword, Sites.GOOGLE_FULL])
+                    tasks.append([keyword, Sites.GOOGLE_FULL, q])
                 else:
-                    tasks.append([keyword, Sites.GOOGLE])
+                    tasks.append([keyword, Sites.GOOGLE, q])
 
             if self.do_naver:
                 if self.full_resolution:
-                    tasks.append([keyword, Sites.NAVER_FULL])
+                    tasks.append([keyword, Sites.NAVER_FULL, q])
                 else:
-                    tasks.append([keyword, Sites.NAVER])
+                    tasks.append([keyword, Sites.NAVER, q])
 
-        pool = Pool(self.n_threads)
+#         pool.apply_async(self.writer, (q, len(keyword)))
         pool.map_async(self.download, tasks)
         pool.close()
         pool.join()
@@ -325,6 +390,40 @@ class AutoCrawler:
                 print('Now re-run this program to re-download removed files. (with skip_already_exist=True)')
         else:
             print('Data imbalance not detected.')
+            
+            
+    def writer(self, q, count):
+        '''listens for messages on the q, writes to file. '''
+
+        check_count = 0
+        
+        with open("hash_crawling.txt", 'a') as f:
+            while 1:
+                m = q.get()
+                if m == "Done":
+                    check_count += 1
+                    if check_count == count:
+                        break
+                h, val = m
+                write_str = "%d,,,%s"%(h, val)
+                f.write(str(m) + '\n')
+                f.flush()
+    
+    def write_db(self, h, keyword, path, is_save):
+        conn = sqlite3.connect(self.db_path, isolation_level='EXCLUSIVE')
+        c = conn.cursor()
+        c.execute('INSERT INTO image_hash (hash, keyword, file, is_save)' 'VALUES (?,?,?,?)', (str(h), str(keyword), str(path), is_save))
+        conn.commit()
+        conn.close()
+
+    def exist_db(self, h):
+        conn = sqlite3.connect(self.db_path, isolation_level='EXCLUSIVE')
+        c = conn.cursor()
+        c.execute('select EXISTS (select * from image_hash where hash=? );', (str(h),))
+        result = c.fetchone()[0]
+        conn.commit()
+        conn.close()
+        return True if result == 0 else False
 
 
 if __name__ == '__main__':
@@ -340,6 +439,8 @@ if __name__ == '__main__':
                                                                    'But unstable on thumbnail mode. '
                                                                     'Default: "auto" - false if full=false, true if full=true')
     parser.add_argument('--limit', type=int, default=0, help='Maximum count of images to download per site. (0: infinite)')
+    parser.add_argument('--dir', type=str, default='./download', help='download dir')
+    parser.add_argument('--db_path', type=str, default='/home/jovyan/db/crawler.db', help='db file path')
     args = parser.parse_args()
 
     _skip = False if str(args.skip).lower() == 'false' else True
@@ -348,7 +449,9 @@ if __name__ == '__main__':
     _naver = False if str(args.naver).lower() == 'false' else True
     _full = False if str(args.full).lower() == 'false' else True
     _face = False if str(args.face).lower() == 'false' else True
+    _download = args.dir
     _limit = int(args.limit)
+    _db_path = args.db_path
 
     no_gui_input = str(args.no_gui).lower()
     if no_gui_input == 'auto':
@@ -358,10 +461,20 @@ if __name__ == '__main__':
     else:
         _no_gui = False
 
-    print('Options - skip:{}, threads:{}, google:{}, naver:{}, full_resolution:{}, face:{}, no_gui:{}, limit:{}'
-          .format(_skip, _threads, _google, _naver, _full, _face, _no_gui, _limit))
-
+    print('Options - skip:{}, threads:{}, google:{}, naver:{}, full_resolution:{}, face:{}, no_gui:{}, limit:{}, db_path:{}'
+          .format(_skip, _threads, _google, _naver, _full, _face, _no_gui, _limit, _db_path))
+    
+#     conn = sqlite3.connect(_db_path, isolation_level='EXCLUSIVE')
+#     c = conn.cursor()
+#     c.execute("DROP TABLE image_hash")
+#     c.execute("CREATE TABLE image_hash (hash TEXT, keyword TEXT, file TEXT)")
+#     conn.close()
+    
     crawler = AutoCrawler(skip_already_exist=_skip, n_threads=_threads,
                           do_google=_google, do_naver=_naver, full_resolution=_full,
-                          face=_face, no_gui=_no_gui, limit=_limit)
+                          face=_face, no_gui=_no_gui, limit=_limit,
+                          download_path=_download, db_path=_db_path)
+
+#     crawler.write_db(15115880990815497572, 2, 3)
     crawler.do_crawling()
+
